@@ -1,0 +1,81 @@
+name: Sync Upstream Frappe
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Every Sunday at midnight
+  workflow_dispatch:      # Manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/frappe/frappe.git || true
+          git fetch upstream --tags
+
+      - name: Get latest v15 release
+        id: latest
+        run: |
+          LATEST_TAG=$(git tag -l 'v15.*' --sort=-version:refname | head -1)
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "Latest v15 tag: $LATEST_TAG"
+
+      - name: Check if already synced
+        id: check
+        run: |
+          if git merge-base --is-ancestor ${{ steps.latest.outputs.tag }} HEAD 2>/dev/null; then
+            echo "already_synced=true" >> $GITHUB_OUTPUT
+            echo "Already up to date with ${{ steps.latest.outputs.tag }}"
+          else
+            echo "already_synced=false" >> $GITHUB_OUTPUT
+            echo "New version available: ${{ steps.latest.outputs.tag }}"
+          fi
+
+      - name: Create sync branch
+        if: steps.check.outputs.already_synced == 'false'
+        run: |
+          BRANCH_NAME="sync/upstream-${{ steps.latest.outputs.tag }}"
+          git checkout -b $BRANCH_NAME
+          git merge ${{ steps.latest.outputs.tag }} --no-edit || {
+            echo "Merge conflict detected. Manual intervention required."
+            exit 1
+          }
+          git push origin $BRANCH_NAME
+
+      - name: Create Pull Request
+        if: steps.check.outputs.already_synced == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --title "Sync: Upstream Frappe ${{ steps.latest.outputs.tag }}" \
+            --body "## Automated Sync with Upstream Frappe
+
+This PR syncs our fork with the latest Frappe release: \`${{ steps.latest.outputs.tag }}\`
+
+### Changes
+- Merged upstream changes from frappe/frappe
+
+### Review Checklist
+- [ ] Review breaking changes in upstream
+- [ ] Test locally before merging
+- [ ] Update our customizations if needed
+
+---
+*This PR was automatically created by GitHub Actions*" \
+            --base main

@@ -2,7 +2,7 @@ name: Sync Upstream Frappe
 
 on:
   schedule:
-    - cron: '0 0 * * 0'  # Every Sunday at midnight
+    - cron: '0 0 * * 0'  # Every Sunday at midnight UTC
   workflow_dispatch:      # Manual trigger
 
 jobs:
@@ -11,10 +11,11 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    
+
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: version-15
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -26,56 +27,87 @@ jobs:
       - name: Add upstream remote
         run: |
           git remote add upstream https://github.com/frappe/frappe.git || true
-          git fetch upstream --tags
+          git fetch upstream version-15 --tags
 
       - name: Get latest v15 release
         id: latest
         run: |
-          LATEST_TAG=$(git tag -l 'v15.*' --sort=-version:refname | head -1)
+          LATEST_TAG=$(git tag -l 'v15.[0-9]*.[0-9]*' --sort=-version:refname | grep -v -E '(beta|rc|alpha)' | head -1)
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No v15 tags found!"
+            exit 1
+          fi
           echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
           echo "Latest v15 tag: $LATEST_TAG"
 
       - name: Check if already synced
         id: check
+        env:
+          LATEST_TAG: ${{ steps.latest.outputs.tag }}
         run: |
-          if git merge-base --is-ancestor ${{ steps.latest.outputs.tag }} HEAD 2>/dev/null; then
+          if git merge-base --is-ancestor "$LATEST_TAG" HEAD 2>/dev/null; then
             echo "already_synced=true" >> $GITHUB_OUTPUT
-            echo "Already up to date with ${{ steps.latest.outputs.tag }}"
+            echo "Already up to date with $LATEST_TAG"
           else
             echo "already_synced=false" >> $GITHUB_OUTPUT
-            echo "New version available: ${{ steps.latest.outputs.tag }}"
+            echo "New version available: $LATEST_TAG"
           fi
 
-      - name: Create sync branch
+      - name: Create sync branch and merge
         if: steps.check.outputs.already_synced == 'false'
+        id: merge
+        env:
+          LATEST_TAG: ${{ steps.latest.outputs.tag }}
         run: |
-          BRANCH_NAME="sync/upstream-${{ steps.latest.outputs.tag }}"
-          git checkout -b $BRANCH_NAME
-          git merge ${{ steps.latest.outputs.tag }} --no-edit || {
+          BRANCH_NAME="sync/upstream-${LATEST_TAG}"
+
+          if git ls-remote --exit-code --heads origin "$BRANCH_NAME" >/dev/null 2>&1; then
+            echo "Branch $BRANCH_NAME already exists, skipping"
+            echo "branch_created=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          git checkout -b "$BRANCH_NAME"
+
+          if git merge "$LATEST_TAG" --no-edit; then
+            git push origin "$BRANCH_NAME"
+            echo "branch_created=true" >> $GITHUB_OUTPUT
+            echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          else
             echo "Merge conflict detected. Manual intervention required."
+            echo "branch_created=false" >> $GITHUB_OUTPUT
+            git merge --abort
             exit 1
-          }
-          git push origin $BRANCH_NAME
+          fi
 
       - name: Create Pull Request
-        if: steps.check.outputs.already_synced == 'false'
+        if: steps.check.outputs.already_synced == 'false' && steps.merge.outputs.branch_created == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH_NAME: ${{ steps.merge.outputs.branch_name }}
+          LATEST_TAG: ${{ steps.latest.outputs.tag }}
         run: |
+          EXISTING_PR=$(gh pr list --head "$BRANCH_NAME" --json number --jq '.[0].number')
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR #$EXISTING_PR already exists for this branch"
+            exit 0
+          fi
+
           gh pr create \
-            --title "Sync: Upstream Frappe ${{ steps.latest.outputs.tag }}" \
+            --title "Sync: Upstream Frappe $LATEST_TAG" \
             --body "## Automated Sync with Upstream Frappe
 
-This PR syncs our fork with the latest Frappe release: \`${{ steps.latest.outputs.tag }}\`
+This PR syncs our fork with the latest Frappe release: \`$LATEST_TAG\`
 
 ### Changes
 - Merged upstream changes from frappe/frappe
+- See release notes: https://github.com/frappe/frappe/releases/tag/$LATEST_TAG
 
 ### Review Checklist
-- [ ] Review breaking changes in upstream
+- [ ] Review breaking changes in upstream release notes
 - [ ] Test locally before merging
-- [ ] Update our customizations if needed
+- [ ] Rebuild Docker image after merge
 
 ---
-*This PR was automatically created by GitHub Actions*" \
-            --base main
+*Automatically created by GitHub Actions*" \
+            --base version-15
